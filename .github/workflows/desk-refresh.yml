@@ -1,0 +1,95 @@
+# desk-refresh.yml — the whole stock desk, run in the cloud (D-019, 2026-09-25).
+#
+# THIS FILE LIVES IN TWO PLACES AND ONLY ONE IS THE SOURCE.
+#   source : parts/work/own-stock-desk/app-v2/runner/desk-refresh.yml (private repo)
+#   copy   : .github/workflows/desk-refresh.yml in the PUBLIC repo
+#            Mioc4ad/stock-desk-runner — which holds this one file and nothing else.
+# Why a separate public repo: GitHub Actions on the private repo has been switched
+# off by the owner since 2026-09-05 (R26; a dispatch of 2026-09-09 is still
+# "queued"), and Actions minutes on a PUBLIC repo cost nothing. He chose that on
+# 2026-09-25. The desk's CODE stays private: this job checks the private repo out
+# with a read-only token, so the public repo carries no code, no watchlist, no data.
+#
+# WHO STARTS IT: the «Cập nhật dữ liệu» button. The desk's Worker (worker.js,
+# POST /refresh/run) checks that the caller is the one owner, then dispatches this
+# workflow with a token that can do nothing but run Actions on this runner repo.
+# Also on a weekday schedule, after the close, so the screen is fresh by evening
+# even if nobody presses anything.
+#
+# SECRETS (set by the owner in the runner repo → Settings → Secrets → Actions;
+# no agent ever sees a value):
+#   SOURCE_REPO_TOKEN  fine-grained PAT, Contents: Read-only, on loc-general-agent only
+#   FIREANT_TOKEN      the Fireant bearer (D-019 moved it here from his PC .env)
+#   STOCK_SYNC_URL     the stock-sync Edge Function URL
+#   STOCK_SYNC_AUTH    the shared sync secret the Edge Function accepts
+#
+# THE LOG IS PUBLIC — anyone can read a public repo's run log. So the desk's own
+# output goes to a file on the runner, never to the log, and the log carries only
+# the stage lines and the re-read-from-disk verify block. GitHub masks secret
+# values in logs besides; this keeps the market read itself out of view too.
+name: desk-refresh
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 15:20 giờ VN (08:20 UTC), thứ Hai–thứ Sáu: after HOSE's 15:00 close + ATC.
+    - cron: '20 8 * * 1-5'
+
+permissions:
+  contents: read
+
+# One run at a time. A second press while a run is going is answered by the
+# Worker with the run already going; this is the belt under that brace.
+concurrency:
+  group: desk-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Lấy code desk (repo riêng tư, chỉ đọc)
+        uses: actions/checkout@v4
+        with:
+          repository: Mioc4ad/loc-general-agent
+          ref: main
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          path: src
+          sparse-checkout: |
+            .claude/skills/vn-stock-desk
+            parts/work/own-stock-desk
+            parts/law
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cài thư viện
+        run: python -m pip install --quiet numpy pandas requests
+
+      - name: Chạy toàn bộ desk và đẩy lên Supabase
+        env:
+          VN_STOCK_PROJECT: ${{ github.workspace }}/src/parts/work/own-stock-desk
+          FIREANT_TOKEN: ${{ secrets.FIREANT_TOKEN }}
+          STOCK_SYNC_URL: ${{ secrets.STOCK_SYNC_URL }}
+          STOCK_SYNC_AUTH: ${{ secrets.STOCK_SYNC_AUTH }}
+          PYTHONUTF8: '1'
+        working-directory: src/.claude/skills/vn-stock-desk/scripts
+        run: |
+          # desk_run.py --yes --require-push: the same chain RUN-DESK.cmd runs on
+          # his PC, except that an UNCONFIGURED push is a failure here — a cloud
+          # run whose results reach nobody is exactly the silent green this
+          # button must never show.
+          set +e
+          python desk_run.py --yes --require-push > "$RUNNER_TEMP/desk.log" 2>&1
+          rc=$?
+          set -e
+          # Public log: stage lines and the verify block only.
+          grep -E '^--- |^  (co|THIEU|advice|Bao cao|Sang loc)|KIEM TRA LAI|^Co buoc|^Xong|^Chua chay|^  - ' "$RUNNER_TEMP/desk.log" || true
+          if [ "$rc" -ne 0 ]; then
+            # A red run must say WHY where he can read it; error lines only.
+            echo '--- dong loi (toi da 20):'
+            grep -E 'Error|FAIL|LOI|Fireant|HTTP [45][0-9][0-9]' "$RUNNER_TEMP/desk.log" | tail -20 || true
+          fi
+          exit $rc
